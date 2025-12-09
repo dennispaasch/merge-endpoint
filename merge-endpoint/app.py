@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse
 from pydub import AudioSegment, silence
-import tempfile, os, uuid, requests
+import tempfile, os, uuid, requests, json
 
 app = FastAPI()
 
@@ -10,7 +10,11 @@ def health():
     return {"ok": True}
 
 @app.post("/merge")
-def merge(payload: dict):
+def merge(payload=Body(...)):
+    # Langdock schickt evtl. Text -> falls ja, in dict umwandeln
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
     a_url = payload.get("a_url")
     b_url = payload.get("b_url")
     min_silence_ms = int(payload.get("min_silence_ms", 2000))
@@ -20,19 +24,20 @@ def merge(payload: dict):
     if not a_url or not b_url:
         raise HTTPException(400, "a_url and b_url are required")
 
+    # ---- Inputs in Temp-Ordner laden
     with tempfile.TemporaryDirectory() as td:
         a_path = os.path.join(td, "a.mp3")
         b_path = os.path.join(td, "b.mp3")
 
-        ra = requests.get(a_url)
-        rb = requests.get(b_url)
-        if ra.status_code != 200 or rb.status_code != 200:
-            raise HTTPException(400, "Could not download one of the files")
+        def download(url, path):
+            r = requests.get(url, timeout=30, allow_redirects=True)
+            if r.status_code != 200:
+                raise HTTPException(400, f"Download failed: {url}")
+            with open(path, "wb") as f:
+                f.write(r.content)
 
-        with open(a_path, "wb") as f:
-            f.write(ra.content)
-        with open(b_path, "wb") as f:
-            f.write(rb.content)
+        download(a_url, a_path)
+        download(b_url, b_path)
 
         a = AudioSegment.from_file(a_path)
         b = AudioSegment.from_file(b_path)
@@ -60,7 +65,17 @@ def merge(payload: dict):
                 out += b_chunks[i]
             i += 1
 
-        out_path = os.path.join(td, f"merged_{uuid.uuid4().hex}.mp3")
-        out.export(out_path, format="mp3")
+    # ---- Output außerhalb des TemporaryDirectory speichern!
+    out_file = tempfile.NamedTemporaryFile(
+        suffix=".mp3", delete=False
+    )
+    out_path = out_file.name
+    out_file.close()
 
-        return FileResponse(out_path, media_type="audio/mpeg", filename="merged.mp3")
+    out.export(out_path, format="mp3")
+
+    return FileResponse(
+        out_path,
+        media_type="audio/mpeg",
+        filename="merged.mp3"
+    )
