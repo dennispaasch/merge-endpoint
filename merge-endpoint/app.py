@@ -5,7 +5,7 @@ import tempfile, os, uuid, requests, json, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-APP_VERSION = "merge-async-v3-gap-startwith-2025-12-09"
+APP_VERSION = "merge-async-v4-keep-pattern-2025-12-09"
 
 # Speicherort für fertige MP3s
 STORE_DIR = "/tmp/merged_store"
@@ -43,24 +43,38 @@ def _merge_job(job_id: str, payload: dict):
     try:
         jobs[job_id]["status"] = "running"
 
+        # Pflicht
         a_url = payload.get("a_url")
         b_url = payload.get("b_url")
+        if not a_url or not b_url:
+            raise RuntimeError("a_url and b_url are required")
+
+        # Silence/Chunk-Parameter
         min_silence_ms = int(payload.get("min_silence_ms", 2000))
         silence_thresh_dbfs = int(payload.get("silence_thresh_dbfs", -35))
 
-        # NEW: start order + mini gap
-        start_with = payload.get("start_with", "a")  # "a" oder "b"
-        gap_ms = int(payload.get("gap_ms", 300))     # z.B. 300ms
+        # Stufe 2: Tail/Satzende retten
+        keep_silence_ms = int(payload.get("keep_silence_ms", 300))  # hinten dran
+        pre_pad_ms = int(payload.get("pre_pad_ms", 50))             # vorne minimal Luft
 
-        if not a_url or not b_url:
-            raise RuntimeError("a_url and b_url are required")
+        # Start / Gap
+        start_with = payload.get("start_with", "a")  # "a" oder "b"
+        gap_ms = int(payload.get("gap_ms", 300))
+
+        # Stufe 3: Pattern aus Skript
+        pattern = payload.get("pattern")  # optional: ["A","B","A"...] oder None
+        if pattern is not None and not isinstance(pattern, list):
+            raise RuntimeError("pattern must be a list like ['A','B',...]")
 
         print("MERGE job start", job_id)
         print("params", {
             "min_silence_ms": min_silence_ms,
             "silence_thresh_dbfs": silence_thresh_dbfs,
+            "keep_silence_ms": keep_silence_ms,
+            "pre_pad_ms": pre_pad_ms,
             "start_with": start_with,
-            "gap_ms": gap_ms
+            "gap_ms": gap_ms,
+            "pattern_len": len(pattern) if pattern else None
         })
 
         with tempfile.TemporaryDirectory() as td:
@@ -71,7 +85,6 @@ def _merge_job(job_id: str, payload: dict):
             sb = _download(b_url, b_path)
             print("download sizes", sa, sb)
 
-            # Audio laden
             a = AudioSegment.from_file(a_path)
             b = AudioSegment.from_file(b_path)
 
@@ -84,7 +97,7 @@ def _merge_job(job_id: str, payload: dict):
                     audio,
                     min_silence_len=min_silence_ms,
                     silence_thresh=silence_thresh_dbfs,
-                    seek_step=10  # SPEED-FIX: Default 1ms wäre extrem langsam
+                    seek_step=10  # Default 1ms wäre extrem langsam
                 )
 
                 # SAFETY: zu viele Micro-Chunks => nicht splitten
@@ -92,7 +105,14 @@ def _merge_job(job_id: str, payload: dict):
                     print("too many chunks, skipping split")
                     return [audio]
 
-                return [audio[s:e] for s, e in ranges]
+                # Stufe 2: Chunks mit Padding schneiden
+                out_chunks = []
+                audio_len = len(audio)
+                for s, e in ranges:
+                    s2 = max(0, s - pre_pad_ms)
+                    e2 = min(audio_len, e + keep_silence_ms)
+                    out_chunks.append(audio[s2:e2])
+                return out_chunks
 
             print("detect chunks")
             a_chunks = chunks_from_nonsilent(a)
@@ -100,28 +120,58 @@ def _merge_job(job_id: str, payload: dict):
             print("chunks", len(a_chunks), len(b_chunks))
 
             gap = AudioSegment.silent(duration=gap_ms)
-
-            # NEW: abwechselnd zusammensetzen, mit Mini-Pause nach jedem Turn
             out = AudioSegment.silent(0)
-            i = 0
 
             def add(seg):
                 nonlocal out
                 out += seg
                 out += gap
 
-            while i < len(a_chunks) or i < len(b_chunks):
-                if start_with == "a":
-                    if i < len(a_chunks):
-                        add(a_chunks[i])
-                    if i < len(b_chunks):
-                        add(b_chunks[i])
-                else:  # start_with == "b"
-                    if i < len(b_chunks):
-                        add(b_chunks[i])
-                    if i < len(a_chunks):
-                        add(a_chunks[i])
-                i += 1
+            # Stufe 3: Pattern-gesteuertes Mergen
+            a_i = 0
+            b_i = 0
+
+            if pattern:
+                for p in pattern:
+                    sp = str(p).upper().strip()
+                    if sp == "A":
+                        if a_i < len(a_chunks):
+                            add(a_chunks[a_i]); a_i += 1
+                    elif sp == "B":
+                        if b_i < len(b_chunks):
+                            add(b_chunks[b_i]); b_i += 1
+                    else:
+                        # unbekanntes Pattern-Element ignorieren
+                        continue
+
+                # Reste hinten dranhängen (falls Pattern zu kurz war)
+                while a_i < len(a_chunks) or b_i < len(b_chunks):
+                    if start_with.lower() == "a":
+                        if a_i < len(a_chunks):
+                            add(a_chunks[a_i]); a_i += 1
+                        if b_i < len(b_chunks):
+                            add(b_chunks[b_i]); b_i += 1
+                    else:
+                        if b_i < len(b_chunks):
+                            add(b_chunks[b_i]); b_i += 1
+                        if a_i < len(a_chunks):
+                            add(a_chunks[a_i]); a_i += 1
+
+            else:
+                # Fallback: altes Verhalten (start_with + alternierend)
+                i = 0
+                while i < len(a_chunks) or i < len(b_chunks):
+                    if start_with.lower() == "a":
+                        if i < len(a_chunks):
+                            add(a_chunks[i])
+                        if i < len(b_chunks):
+                            add(b_chunks[i])
+                    else:
+                        if i < len(b_chunks):
+                            add(b_chunks[i])
+                        if i < len(a_chunks):
+                            add(a_chunks[i])
+                    i += 1
 
             # Export nach /tmp/merged_store
             out_path = os.path.join(STORE_DIR, f"{job_id}.mp3")
