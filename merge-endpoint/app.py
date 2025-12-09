@@ -5,13 +5,13 @@ import tempfile, os, uuid, requests, json, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-APP_VERSION = "merge-async-v1-2025-12-09"
+APP_VERSION = "merge-async-v2-fast-2025-12-09"
 
-# Wo fertige MP3s liegen (Render erlaubt /tmp)
+# Speicherort für fertige MP3s (Render erlaubt /tmp)
 STORE_DIR = "/tmp/merged_store"
 os.makedirs(STORE_DIR, exist_ok=True)
 
-# Job-Status im RAM (bei Neustart weg – aber ok für euren Workflow)
+# Job-Status im RAM (bei Neustart weg – ok für Workflow)
 jobs = {}  # job_id -> dict(status, created_at, done_at, error, out_path)
 
 # ThreadPool für Background-Jobs
@@ -65,18 +65,33 @@ def _merge_job(job_id: str, payload: dict):
             sb = _download(b_url, b_path)
             print("download sizes", sa, sb)
 
-            a = AudioSegment.from_file(a_path).set_frame_rate(22050).set_channels(1)
-            b = AudioSegment.from_file(b_path).set_frame_rate(22050).set_channels(1)
+            # Audio laden
+            a = AudioSegment.from_file(a_path)
+            b = AudioSegment.from_file(b_path)
+
+            # >>> SPEED-FIX 1:
+            # Für Sprachpausen reicht 16kHz Mono völlig, macht Detect deutlich schneller
+            a = a.set_frame_rate(16000).set_channels(1)
+            b = b.set_frame_rate(16000).set_channels(1)
 
             def chunks_from_nonsilent(audio):
                 ranges = silence.detect_nonsilent(
                     audio,
                     min_silence_len=min_silence_ms,
-                    silence_thresh=silence_thresh_dbfs
+                    silence_thresh=silence_thresh_dbfs,
+
+                    # >>> SPEED-FIX 2:
+                    # Standard ist 1ms (extrem langsam). 10ms ist schnell & präzise genug.
+                    seek_step=10
                 )
-                # extrem viele Mini-Segmente → lieber nicht splitten
-                if len(ranges) > 200:
+
+                # >>> SAFETY-NET:
+                # Wenn zu viele Mini-Chunks entstehen (Atmer etc.), NICHT splitten.
+                # Das verhindert "ewige" Jobs.
+                if len(ranges) > 80:
+                    print("too many chunks, skipping split")
                     return [audio]
+
                 return [audio[s:e] for s, e in ranges]
 
             print("detect chunks")
@@ -84,6 +99,7 @@ def _merge_job(job_id: str, payload: dict):
             b_chunks = chunks_from_nonsilent(b)
             print("chunks", len(a_chunks), len(b_chunks))
 
+            # Abwechselnd zusammensetzen: A1 B1 A2 B2 ...
             out = AudioSegment.silent(0)
             i = 0
             while i < len(a_chunks) or i < len(b_chunks):
@@ -93,10 +109,11 @@ def _merge_job(job_id: str, payload: dict):
                     out += b_chunks[i]
                 i += 1
 
-        out_path = os.path.join(STORE_DIR, f"{job_id}.mp3")
-        print("export", out_path)
-        out.export(out_path, format="mp3")
-        print("export done size", os.path.getsize(out_path))
+            # Export nach /tmp/merged_store
+            out_path = os.path.join(STORE_DIR, f"{job_id}.mp3")
+            print("export", out_path)
+            out.export(out_path, format="mp3")
+            print("export done size", os.path.getsize(out_path))
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["done_at"] = time.time()
@@ -127,7 +144,6 @@ def merge_async(payload=Body(...)):
         "out_path": None
     }
 
-    # Job im Hintergrund starten
     executor.submit(_merge_job, job_id, payload)
 
     return {
@@ -152,6 +168,9 @@ def status(job_id: str):
 
     if job["status"] == "done":
         resp["download_url"] = f"https://merge-endpoint.onrender.com/download/{job_id}"
+
+    if job["status"] == "error":
+        resp["trace"] = job.get("trace")
 
     return resp
 
