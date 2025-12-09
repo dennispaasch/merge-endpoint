@@ -5,7 +5,7 @@ import tempfile, os, uuid, requests, json, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-APP_VERSION = "merge-async-v4-keep-pattern-2025-12-09"
+APP_VERSION = "merge-async-v5-keep-pattern-capfix-2025-12-09"
 
 # Speicherort für fertige MP3s
 STORE_DIR = "/tmp/merged_store"
@@ -100,9 +100,10 @@ def _merge_job(job_id: str, payload: dict):
                     seek_step=10  # Default 1ms wäre extrem langsam
                 )
 
-                # SAFETY: zu viele Micro-Chunks => nicht splitten
-                if len(ranges) > 80:
-                    print("too many chunks, skipping split")
+                # ✅ MINI-PATCH:
+                # SAFETY nur noch OHNE pattern anwenden
+                if (not pattern) and len(ranges) > 80:
+                    print("too many chunks, skipping split (no pattern)")
                     return [audio]
 
                 # Stufe 2: Chunks mit Padding schneiden
@@ -118,6 +119,19 @@ def _merge_job(job_id: str, payload: dict):
             a_chunks = chunks_from_nonsilent(a)
             b_chunks = chunks_from_nonsilent(b)
             print("chunks", len(a_chunks), len(b_chunks))
+
+            # ✅ OPTIONALER GUARD:
+            # Wenn Pattern da ist, aber Chunk-Zahlen völlig daneben,
+            # lieber sauber Fehler werfen als Chaos-MP3 erzeugen.
+            if pattern:
+                expected_a = sum(1 for p in pattern if str(p).upper().strip() == "A")
+                expected_b = sum(1 for p in pattern if str(p).upper().strip() == "B")
+                if abs(expected_a - len(a_chunks)) > 1 or abs(expected_b - len(b_chunks)) > 1:
+                    raise RuntimeError(
+                        f"Pattern/Chunk mismatch: expected A={expected_a}, B={expected_b} "
+                        f"but got A_chunks={len(a_chunks)}, B_chunks={len(b_chunks)}. "
+                        f"Check ElevenLabs breaks or silence params."
+                    )
 
             gap = AudioSegment.silent(duration=gap_ms)
             out = AudioSegment.silent(0)
@@ -141,7 +155,6 @@ def _merge_job(job_id: str, payload: dict):
                         if b_i < len(b_chunks):
                             add(b_chunks[b_i]); b_i += 1
                     else:
-                        # unbekanntes Pattern-Element ignorieren
                         continue
 
                 # Reste hinten dranhängen (falls Pattern zu kurz war)
