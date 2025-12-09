@@ -5,16 +5,16 @@ import tempfile, os, uuid, requests, json, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-APP_VERSION = "merge-async-v2-fast-2025-12-09"
+APP_VERSION = "merge-async-v3-gap-startwith-2025-12-09"
 
-# Speicherort für fertige MP3s (Render erlaubt /tmp)
+# Speicherort für fertige MP3s
 STORE_DIR = "/tmp/merged_store"
 os.makedirs(STORE_DIR, exist_ok=True)
 
-# Job-Status im RAM (bei Neustart weg – ok für Workflow)
+# Job-Status (im RAM)
 jobs = {}  # job_id -> dict(status, created_at, done_at, error, out_path)
 
-# ThreadPool für Background-Jobs
+# Background-Threads
 executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -35,7 +35,7 @@ def _download(url, path):
         f.write(r.content)
     size = os.path.getsize(path)
     if size < 1000:
-        raise RuntimeError("Downloaded file too small, likely not audio")
+        raise RuntimeError("Downloaded file too small (not audio?)")
     return size
 
 
@@ -48,13 +48,19 @@ def _merge_job(job_id: str, payload: dict):
         min_silence_ms = int(payload.get("min_silence_ms", 2000))
         silence_thresh_dbfs = int(payload.get("silence_thresh_dbfs", -35))
 
+        # NEW: start order + mini gap
+        start_with = payload.get("start_with", "a")  # "a" oder "b"
+        gap_ms = int(payload.get("gap_ms", 300))     # z.B. 300ms
+
         if not a_url or not b_url:
             raise RuntimeError("a_url and b_url are required")
 
         print("MERGE job start", job_id)
         print("params", {
             "min_silence_ms": min_silence_ms,
-            "silence_thresh_dbfs": silence_thresh_dbfs
+            "silence_thresh_dbfs": silence_thresh_dbfs,
+            "start_with": start_with,
+            "gap_ms": gap_ms
         })
 
         with tempfile.TemporaryDirectory() as td:
@@ -69,8 +75,7 @@ def _merge_job(job_id: str, payload: dict):
             a = AudioSegment.from_file(a_path)
             b = AudioSegment.from_file(b_path)
 
-            # >>> SPEED-FIX 1:
-            # Für Sprachpausen reicht 16kHz Mono völlig, macht Detect deutlich schneller
+            # SPEED-FIX: 16kHz Mono reicht für Sprachpausen und ist viel schneller
             a = a.set_frame_rate(16000).set_channels(1)
             b = b.set_frame_rate(16000).set_channels(1)
 
@@ -79,15 +84,10 @@ def _merge_job(job_id: str, payload: dict):
                     audio,
                     min_silence_len=min_silence_ms,
                     silence_thresh=silence_thresh_dbfs,
-
-                    # >>> SPEED-FIX 2:
-                    # Standard ist 1ms (extrem langsam). 10ms ist schnell & präzise genug.
-                    seek_step=10
+                    seek_step=10  # SPEED-FIX: Default 1ms wäre extrem langsam
                 )
 
-                # >>> SAFETY-NET:
-                # Wenn zu viele Mini-Chunks entstehen (Atmer etc.), NICHT splitten.
-                # Das verhindert "ewige" Jobs.
+                # SAFETY: zu viele Micro-Chunks => nicht splitten
                 if len(ranges) > 80:
                     print("too many chunks, skipping split")
                     return [audio]
@@ -99,14 +99,28 @@ def _merge_job(job_id: str, payload: dict):
             b_chunks = chunks_from_nonsilent(b)
             print("chunks", len(a_chunks), len(b_chunks))
 
-            # Abwechselnd zusammensetzen: A1 B1 A2 B2 ...
+            gap = AudioSegment.silent(duration=gap_ms)
+
+            # NEW: abwechselnd zusammensetzen, mit Mini-Pause nach jedem Turn
             out = AudioSegment.silent(0)
             i = 0
+
+            def add(seg):
+                nonlocal out
+                out += seg
+                out += gap
+
             while i < len(a_chunks) or i < len(b_chunks):
-                if i < len(a_chunks):
-                    out += a_chunks[i]
-                if i < len(b_chunks):
-                    out += b_chunks[i]
+                if start_with == "a":
+                    if i < len(a_chunks):
+                        add(a_chunks[i])
+                    if i < len(b_chunks):
+                        add(b_chunks[i])
+                else:  # start_with == "b"
+                    if i < len(b_chunks):
+                        add(b_chunks[i])
+                    if i < len(a_chunks):
+                        add(a_chunks[i])
                 i += 1
 
             # Export nach /tmp/merged_store
@@ -128,7 +142,7 @@ def _merge_job(job_id: str, payload: dict):
 
 @app.post("/merge_async")
 def merge_async(payload=Body(...)):
-    # Langdock kann JSON als String schicken
+    # Langdock schickt manchmal JSON als String
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
