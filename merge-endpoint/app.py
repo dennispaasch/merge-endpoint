@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import FileResponse
 from pydub import AudioSegment, silence
+from pydub.generators import Sine
 import tempfile, os, uuid, requests, json, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-APP_VERSION = "merge-async-v5-keep-pattern-capfix-2025-12-09"
+APP_VERSION = "merge-async-v6-bleep-on-switch-2025-12-10"
 
 # Speicherort für fertige MP3s
 STORE_DIR = "/tmp/merged_store"
@@ -53,7 +54,7 @@ def _merge_job(job_id: str, payload: dict):
         min_silence_ms = int(payload.get("min_silence_ms", 2000))
         silence_thresh_dbfs = int(payload.get("silence_thresh_dbfs", -35))
 
-        # Stufe 2: Tail/Satzende retten
+        # Tail/Satzende retten
         keep_silence_ms = int(payload.get("keep_silence_ms", 300))  # hinten dran
         pre_pad_ms = int(payload.get("pre_pad_ms", 50))             # vorne minimal Luft
 
@@ -61,7 +62,7 @@ def _merge_job(job_id: str, payload: dict):
         start_with = payload.get("start_with", "a")  # "a" oder "b"
         gap_ms = int(payload.get("gap_ms", 300))
 
-        # Stufe 3: Pattern aus Skript
+        # Pattern aus Skript
         pattern = payload.get("pattern")  # optional: ["A","B","A"...] oder None
         if pattern is not None and not isinstance(pattern, list):
             raise RuntimeError("pattern must be a list like ['A','B',...]")
@@ -97,16 +98,14 @@ def _merge_job(job_id: str, payload: dict):
                     audio,
                     min_silence_len=min_silence_ms,
                     silence_thresh=silence_thresh_dbfs,
-                    seek_step=10  # Default 1ms wäre extrem langsam
+                    seek_step=10
                 )
 
-                # ✅ MINI-PATCH:
-                # SAFETY nur noch OHNE pattern anwenden
+                # Cap nur noch OHNE pattern
                 if (not pattern) and len(ranges) > 80:
                     print("too many chunks, skipping split (no pattern)")
                     return [audio]
 
-                # Stufe 2: Chunks mit Padding schneiden
                 out_chunks = []
                 audio_len = len(audio)
                 for s, e in ranges:
@@ -120,9 +119,7 @@ def _merge_job(job_id: str, payload: dict):
             b_chunks = chunks_from_nonsilent(b)
             print("chunks", len(a_chunks), len(b_chunks))
 
-            # ✅ OPTIONALER GUARD:
-            # Wenn Pattern da ist, aber Chunk-Zahlen völlig daneben,
-            # lieber sauber Fehler werfen als Chaos-MP3 erzeugen.
+            # Guard gegen Pattern/Chunk-Mismatch
             if pattern:
                 expected_a = sum(1 for p in pattern if str(p).upper().strip() == "A")
                 expected_b = sum(1 for p in pattern if str(p).upper().strip() == "B")
@@ -130,18 +127,32 @@ def _merge_job(job_id: str, payload: dict):
                     raise RuntimeError(
                         f"Pattern/Chunk mismatch: expected A={expected_a}, B={expected_b} "
                         f"but got A_chunks={len(a_chunks)}, B_chunks={len(b_chunks)}. "
-                        f"Check ElevenLabs breaks or silence params."
+                        f"Check TTS breaks or silence params."
                     )
 
+            # Pause zwischen Segmenten
             gap = AudioSegment.silent(duration=gap_ms)
+
+            # --- Bleep nur beim Sprecherwechsel ---
+            bleep_hz = int(payload.get("bleep_hz", 1000))
+            bleep_ms = int(payload.get("bleep_ms", 120))
+            bleep_gain_db = int(payload.get("bleep_gain_db", -6))
+            bleep = Sine(bleep_hz).to_audio_segment(duration=bleep_ms).apply_gain(bleep_gain_db)
+
             out = AudioSegment.silent(0)
 
-            def add(seg):
-                nonlocal out
+            last_speaker = None  # merken, wer zuletzt gesprochen hat
+
+            def add(seg, speaker):
+                nonlocal out, last_speaker
+                # Bleep nur wenn Sprecherwechsel
+                if last_speaker is not None and speaker != last_speaker:
+                    out += bleep
                 out += seg
                 out += gap
+                last_speaker = speaker
 
-            # Stufe 3: Pattern-gesteuertes Mergen
+            # Pattern-gesteuertes Mergen
             a_i = 0
             b_i = 0
 
@@ -150,10 +161,10 @@ def _merge_job(job_id: str, payload: dict):
                     sp = str(p).upper().strip()
                     if sp == "A":
                         if a_i < len(a_chunks):
-                            add(a_chunks[a_i]); a_i += 1
+                            add(a_chunks[a_i], "A"); a_i += 1
                     elif sp == "B":
                         if b_i < len(b_chunks):
-                            add(b_chunks[b_i]); b_i += 1
+                            add(b_chunks[b_i], "B"); b_i += 1
                     else:
                         continue
 
@@ -161,14 +172,14 @@ def _merge_job(job_id: str, payload: dict):
                 while a_i < len(a_chunks) or b_i < len(b_chunks):
                     if start_with.lower() == "a":
                         if a_i < len(a_chunks):
-                            add(a_chunks[a_i]); a_i += 1
+                            add(a_chunks[a_i], "A"); a_i += 1
                         if b_i < len(b_chunks):
-                            add(b_chunks[b_i]); b_i += 1
+                            add(b_chunks[b_i], "B"); b_i += 1
                     else:
                         if b_i < len(b_chunks):
-                            add(b_chunks[b_i]); b_i += 1
+                            add(b_chunks[b_i], "B"); b_i += 1
                         if a_i < len(a_chunks):
-                            add(a_chunks[a_i]); a_i += 1
+                            add(a_chunks[a_i], "A"); a_i += 1
 
             else:
                 # Fallback: altes Verhalten (start_with + alternierend)
@@ -176,14 +187,14 @@ def _merge_job(job_id: str, payload: dict):
                 while i < len(a_chunks) or i < len(b_chunks):
                     if start_with.lower() == "a":
                         if i < len(a_chunks):
-                            add(a_chunks[i])
+                            add(a_chunks[i], "A")
                         if i < len(b_chunks):
-                            add(b_chunks[i])
+                            add(b_chunks[i], "B")
                     else:
                         if i < len(b_chunks):
-                            add(b_chunks[i])
+                            add(b_chunks[i], "B")
                         if i < len(a_chunks):
-                            add(a_chunks[i])
+                            add(a_chunks[i], "A")
                     i += 1
 
             # Export nach /tmp/merged_store
